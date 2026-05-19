@@ -12,6 +12,7 @@
   * Append messages immediately instead of waiting for send success. (Related to https://github.com/espressif/esp-claw/issues/36)
   * Use visual indicators for send status and allow retries.
   * Preserve Web Chat history when switching between tabs.
+* Board: Adjusted partition table size to accommodate larger bootloaders on some development boards.
 
 ## 2026-05-18
 
