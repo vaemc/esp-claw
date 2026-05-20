@@ -23,6 +23,8 @@ import { LanguageSwitcher } from '../components/layout/LanguageSwitcher';
 import { Banner } from '../components/ui/Banner';
 import { Button } from '../components/ui/Button';
 import { TextInput } from '../components/ui/FormField';
+import { LabelLink } from '../components/ui/LabelLink';
+import { getProviderLinks, TAVILY_API_KEY_URL } from '../constants/externalLinks';
 import { t } from '../i18n';
 import { appConfig, ensureConfigGroups, patchConfigLocal } from '../state/config';
 import { pushToast } from '../state/toast';
@@ -527,6 +529,7 @@ export const SetupWizardPage: Component<SetupWizardPageProps> = (props) => {
   const remainingPlatforms = createMemo(() =>
     PLATFORM_ORDER.filter((id) => !selectedPlatforms().includes(id)),
   );
+  const providerLinks = createMemo(() => getProviderLinks(provider()));
 
   const applyPreset = (key: ProviderKey) => {
     const preset = PROVIDER_PRESETS[key];
@@ -962,13 +965,35 @@ export const SetupWizardPage: Component<SetupWizardPageProps> = (props) => {
                       </div>
                     </div>
                     <TextInput
-                      label={t('llmModel')}
+                      label={
+                        <>
+                          {t('llmModel')}
+                          <Show when={providerLinks()}>
+                            {(links) => (
+                              <LabelLink href={links().docsUrl}>
+                                {t('llmProviderDocs') as string} ↗
+                              </LabelLink>
+                            )}
+                          </Show>
+                        </>
+                      }
                       value={llmForm.llm_model}
                       onInput={(event) => setLlmForm('llm_model', event.currentTarget.value)}
                     />
                     <TextInput
                       type="password"
-                      label={t('llmApiKey')}
+                      label={
+                        <>
+                          {t('llmApiKey')}
+                          <Show when={providerLinks()}>
+                            {(links) => (
+                              <LabelLink href={links().consoleUrl}>
+                                {t('llmProviderConsole') as string} ↗
+                              </LabelLink>
+                            )}
+                          </Show>
+                        </>
+                      }
                       value={llmForm.llm_api_key}
                       onInput={(event) => setLlmForm('llm_api_key', event.currentTarget.value)}
                     />
@@ -1053,7 +1078,14 @@ export const SetupWizardPage: Component<SetupWizardPageProps> = (props) => {
                   <div class="grid gap-4 sm:grid-cols-2">
                     <TextInput
                       type="password"
-                      label={t('searchTavilyKey')}
+                      label={
+                        <>
+                          {t('searchTavilyKey')}
+                          <LabelLink href={TAVILY_API_KEY_URL}>
+                            {t('llmProviderConsole') as string} ↗
+                          </LabelLink>
+                        </>
+                      }
                       value={searchForm.search_tavily_key}
                       onInput={(event) => setSearchForm('search_tavily_key', event.currentTarget.value)}
                     />

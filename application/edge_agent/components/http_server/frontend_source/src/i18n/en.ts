@@ -112,6 +112,8 @@ export const en = {
   llmProviderAnthropicCompatible: 'Anthropic Compatible API',
   llmProviderCustom: 'Custom',
   llmFillDefaults: 'Fill Default Config',
+  llmProviderDocs: 'Provider Docs',
+  llmProviderConsole: 'Get API Key',
   llmApiKey: 'API Key',
   llmModel: 'Model',
   llmTimeout: 'Timeout (ms)',

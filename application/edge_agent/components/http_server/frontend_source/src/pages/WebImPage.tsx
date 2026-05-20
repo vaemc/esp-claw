@@ -18,8 +18,8 @@ import { t } from '../i18n';
 import { pushToast } from '../state/toast';
 
 const LS_CHAT_ID = 'esp-claw-webim-chat-id';
-const MARKED_CDN_URL = 'https://esp-claw.com/clientjs/marked@18.0.4/lib/marked.umd.min.js';
-const DOMPURIFY_CDN_URL = 'https://esp-claw.com/clientjs/dompurify@3.4.5/dist/purify.min.js';
+const MARKED_CDN_URL = 'https://esp-claw.com/clientjs/marked@18.0.4/marked.umd.min.js';
+const DOMPURIFY_CDN_URL = 'https://esp-claw.com/clientjs/dompurify@3.4.5/purify.min.js';
 const MARKED_CDN_INTEGRITY =
   'sha384-QIom/Ao3tGhg4C4VY5VTDrHMTPzgsih5cGuY30rd/xp6hWQ+xIGIZ4kxhaQQY+PB';
 const DOMPURIFY_CDN_INTEGRITY =

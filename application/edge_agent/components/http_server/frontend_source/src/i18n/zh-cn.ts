@@ -108,6 +108,8 @@ export const zhCn: Dict = {
   llmProviderAnthropicCompatible: 'Anthropic 兼容 API',
   llmProviderCustom: '自定义',
   llmFillDefaults: '填入默认配置',
+  llmProviderDocs: '供应商文档',
+  llmProviderConsole: '获取 API Key',
   llmApiKey: 'API 密钥',
   llmModel: '模型',
   llmTimeout: '超时 (毫秒)',
