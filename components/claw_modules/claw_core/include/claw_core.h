@@ -189,7 +189,9 @@ esp_err_t claw_core_call_cap(const char *cap_name,
 esp_err_t claw_core_publish_stage_text(const claw_core_request_t *request, const char *text);
 esp_err_t claw_core_submit(const claw_core_request_t *request, uint32_t timeout_ms);
 esp_err_t claw_core_cancel_request(uint32_t request_id);
-esp_err_t claw_core_submit_user_message_interrupt(uint32_t request_id, const char *user_text);
+esp_err_t claw_core_submit_user_message_interrupt_for_session(const char *session_id,
+                                                              const char *user_text,
+                                                              uint32_t *out_request_id);
 claw_core_agent_loop_phase_t claw_core_get_agent_loop_phase(void);
 esp_err_t claw_core_receive(claw_core_response_t *response, uint32_t timeout_ms);
 esp_err_t claw_core_receive_for(uint32_t request_id,

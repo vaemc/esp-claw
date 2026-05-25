@@ -37,6 +37,7 @@ static const char *TAG = "claw_core";
 #define CLAW_CORE_DEFAULT_RESPONSE_Q      4
 #define CLAW_CORE_DEFAULT_TOOL_ITERATIONS 10
 #define CLAW_CORE_CONTROL_QUEUE_LEN       4
+#define CLAW_CORE_INFLIGHT_SESSION_ID_SIZE 128
 #ifndef CLAW_CORE_LOG_SNIPPET_LEN
 #define CLAW_CORE_LOG_SNIPPET_LEN         96
 #endif
@@ -110,6 +111,7 @@ typedef struct {
     claw_core_pending_response_t *pending_tail;
     SemaphoreHandle_t inflight_lock;
     uint32_t inflight_request_id;
+    char inflight_session_id[CLAW_CORE_INFLIGHT_SESSION_ID_SIZE];
     claw_core_agent_loop_phase_t agent_loop_phase;
     volatile bool inflight_abort;
     claw_core_control_abort_reason_t inflight_abort_reason;
@@ -501,6 +503,34 @@ static bool take_user_interrupt_http_abort(uint32_t request_id)
     }
     xSemaphoreGive(s_core->inflight_lock);
     return taken;
+}
+
+static esp_err_t queue_user_interrupt_locked(uint32_t request_id, char *owned_text)
+{
+    size_t tail;
+
+    if (s_core->inflight_request_id != request_id) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_IDLE ||
+            s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_FINALIZING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_core->control_queue_count >= CLAW_CORE_CONTROL_QUEUE_LEN) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    tail = (s_core->control_queue_head + s_core->control_queue_count) % CLAW_CORE_CONTROL_QUEUE_LEN;
+    s_core->control_queue[tail].request_id = request_id;
+    s_core->control_queue[tail].user_text = owned_text;
+    s_core->control_queue_count++;
+
+    if (s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_IN_LLM_HTTP &&
+            s_core->inflight_abort_reason != CLAW_CORE_CONTROL_ABORT_REASON_CANCEL) {
+        s_core->inflight_abort = true;
+        s_core->inflight_abort_reason = CLAW_CORE_CONTROL_ABORT_REASON_USER_INTERRUPT;
+    }
+    return ESP_OK;
 }
 
 static void clear_user_interrupt_abort(uint32_t request_id)
@@ -1467,73 +1497,6 @@ static bool cached_contexts_have_messages(const claw_core_cached_context_t *cont
     return false;
 }
 
-static esp_err_t refresh_request_start_only_message_contexts(
-    const claw_core_request_item_t *request,
-    claw_core_cached_context_t *contexts,
-    size_t count)
-{
-    size_t i;
-
-    if (!request || (!contexts && count > 0)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (i = 0; i < s_core->context_provider_count && i < count; i++) {
-        claw_core_context_t context = {0};
-        const claw_core_context_provider_t *provider = &s_core->context_providers[i];
-        esp_err_t err;
-
-        if (!(provider->flags & CLAW_CORE_CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY)) {
-            continue;
-        }
-        if (contexts[i].valid && contexts[i].kind != CLAW_CORE_CONTEXT_KIND_MESSAGES) {
-            continue;
-        }
-
-        err = provider->collect(&request->view, &context, provider->user_ctx);
-        if (err == ESP_ERR_NOT_FOUND) {
-            free(contexts[i].content);
-            memset(&contexts[i], 0, sizeof(contexts[i]));
-            continue;
-        }
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG,
-                     "context refresh failed request=%" PRIu32 " provider=%s err=%s",
-                     request->view.request_id,
-                     provider->name,
-                     esp_err_to_name(err));
-            free(context.content);
-            return err;
-        }
-        if (!context.content || !context.content[0]) {
-            ESP_LOGW(TAG,
-                     "context refresh returned empty content request=%" PRIu32 " provider=%s",
-                     request->view.request_id,
-                     provider->name);
-            free(context.content);
-            return ESP_FAIL;
-        }
-        if (context.kind != CLAW_CORE_CONTEXT_KIND_MESSAGES) {
-            free(context.content);
-            continue;
-        }
-
-        free(contexts[i].content);
-        contexts[i].valid = true;
-        contexts[i].kind = context.kind;
-        contexts[i].content = context.content;
-        context.content = NULL;
-        ESP_LOGI(TAG,
-                 "context_refreshed request=%" PRIu32 " provider=%s context_kind=%s context_len=%u",
-                 request->view.request_id,
-                 provider->name,
-                 context_kind_to_string(contexts[i].kind),
-                 (unsigned)strlen(contexts[i].content));
-    }
-
-    return ESP_OK;
-}
-
 static esp_err_t build_iteration_context(const claw_core_request_item_t *request,
                                          const cJSON *runtime_messages,
                                          const claw_core_cached_context_t *request_start_contexts,
@@ -1685,10 +1648,8 @@ cleanup:
 }
 
 static esp_err_t handle_pending_user_interrupts(const claw_core_request_item_t *request,
+                                                const char *timing_point,
                                                 cJSON **runtime_messages,
-                                                claw_core_cached_context_t *request_start_contexts,
-                                                size_t request_start_context_count,
-                                                bool *inject_active_user,
                                                 bool *out_drained)
 {
     char *texts[CLAW_CORE_CONTROL_QUEUE_LEN] = {0};
@@ -1701,7 +1662,7 @@ static esp_err_t handle_pending_user_interrupts(const claw_core_request_item_t *
     if (out_drained) {
         *out_drained = false;
     }
-    if (!request || !runtime_messages || !inject_active_user || !out_drained) {
+    if (!request || !runtime_messages || !out_drained) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1725,46 +1686,29 @@ static esp_err_t handle_pending_user_interrupts(const claw_core_request_item_t *
         log_session_persist_failure(&request->view,
                                     "persist_session_user_interrupt",
                                     err);
-        goto cleanup;
+        persisted = false;
     }
+    ESP_LOGI(TAG,
+             "user_interrupt_triggered request=%" PRIu32 " timing=%s count=%u persisted=%s",
+             request->view.request_id,
+             timing_point ? timing_point : "unknown",
+             (unsigned)text_count,
+             persisted ? "true" : "false");
 
-    if (persisted) {
-        cJSON_Delete(*runtime_messages);
+    if (!*runtime_messages) {
         *runtime_messages = cJSON_CreateArray();
         if (!*runtime_messages) {
             err = ESP_ERR_NO_MEM;
             goto cleanup;
         }
+    }
 
-        err = refresh_request_start_only_message_contexts(request,
-                                                          request_start_contexts,
-                                                          request_start_context_count);
+    for (i = 0; i < text_count; i++) {
+        err = append_user_message(*runtime_messages, texts[i]);
         if (err != ESP_OK) {
             goto cleanup;
         }
-        *inject_active_user = !cached_contexts_have_messages(request_start_contexts,
-                                                             request_start_context_count);
-    } else {
-        if (!*runtime_messages) {
-            *runtime_messages = cJSON_CreateArray();
-            if (!*runtime_messages) {
-                err = ESP_ERR_NO_MEM;
-                goto cleanup;
-            }
-        }
-        for (i = 0; i < text_count; i++) {
-            err = append_user_message(*runtime_messages, texts[i]);
-            if (err != ESP_OK) {
-                goto cleanup;
-            }
-        }
     }
-
-    ESP_LOGI(TAG,
-             "user_interrupt_drained request=%" PRIu32 " count=%u persisted=%s",
-             request->view.request_id,
-             (unsigned)text_count,
-             persisted ? "true" : "false");
     *out_drained = true;
     err = ESP_OK;
 
@@ -1803,6 +1747,13 @@ static void claw_core_task(void *arg)
 
         if (xSemaphoreTake(s_core->inflight_lock, portMAX_DELAY) == pdTRUE) {
             s_core->inflight_request_id = request.view.request_id;
+            if (request.view.session_id && request.view.session_id[0]) {
+                strlcpy(s_core->inflight_session_id,
+                        request.view.session_id,
+                        sizeof(s_core->inflight_session_id));
+            } else {
+                s_core->inflight_session_id[0] = '\0';
+            }
             s_core->agent_loop_phase = CLAW_CORE_AGENT_LOOP_PHASE_BEFORE_BUILD_ITERATION_CONTEXT;
             s_core->inflight_abort = false;
             s_core->inflight_abort_reason = CLAW_CORE_CONTROL_ABORT_REASON_NONE;
@@ -1901,10 +1852,8 @@ static void claw_core_task(void *arg)
                 bool drained = false;
 
                 err = handle_pending_user_interrupts(&request,
+                                                     "before_build_iteration_context",
                                                      &runtime_messages,
-                                                     request_start_contexts,
-                                                     request_start_context_count,
-                                                     &inject_active_user,
                                                      &drained);
                 if (err != ESP_OK) {
                     response.view.error_message = dup_string(esp_err_to_name(err));
@@ -1936,10 +1885,8 @@ static void claw_core_task(void *arg)
                 bool drained = false;
 
                 err = handle_pending_user_interrupts(&request,
+                                                     "before_llm_http",
                                                      &runtime_messages,
-                                                     request_start_contexts,
-                                                     request_start_context_count,
-                                                     &inject_active_user,
                                                      &drained);
                 if (err != ESP_OK) {
                     response.view.error_message = dup_string(esp_err_to_name(err));
@@ -1963,10 +1910,8 @@ static void claw_core_task(void *arg)
                     free(response.view.error_message);
                     response.view.error_message = NULL;
                     err = handle_pending_user_interrupts(&request,
+                                                         "in_llm_http_abort",
                                                          &runtime_messages,
-                                                         request_start_contexts,
-                                                         request_start_context_count,
-                                                         &inject_active_user,
                                                          &drained);
                     if (err != ESP_OK) {
                         response.view.error_message = dup_string(esp_err_to_name(err));
@@ -1994,10 +1939,8 @@ static void claw_core_task(void *arg)
                 bool drained = false;
 
                 err = handle_pending_user_interrupts(&request,
+                                                     "after_llm_before_tool",
                                                      &runtime_messages,
-                                                     request_start_contexts,
-                                                     request_start_context_count,
-                                                     &inject_active_user,
                                                      &drained);
                 if (err != ESP_OK) {
                     response.view.error_message = dup_string(esp_err_to_name(err));
@@ -2098,6 +2041,7 @@ finish_request:
             bool was_cancelled = s_core->inflight_abort &&
                                  s_core->inflight_abort_reason == CLAW_CORE_CONTROL_ABORT_REASON_CANCEL;
             s_core->inflight_request_id = 0;
+            s_core->inflight_session_id[0] = '\0';
             s_core->agent_loop_phase = CLAW_CORE_AGENT_LOOP_PHASE_IDLE;
             s_core->inflight_abort = false;
             s_core->inflight_abort_reason = CLAW_CORE_CONTROL_ABORT_REASON_NONE;
@@ -2371,15 +2315,18 @@ esp_err_t claw_core_cancel_request(uint32_t request_id)
     return armed ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t claw_core_submit_user_message_interrupt(uint32_t request_id, const char *user_text)
+esp_err_t claw_core_submit_user_message_interrupt_for_session(const char *session_id,
+                                                              const char *user_text,
+                                                              uint32_t *out_request_id)
 {
     char *owned_text = NULL;
-    size_t tail;
+    uint32_t request_id;
+    esp_err_t err;
 
     if (!s_core || !s_core->initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (request_id == 0 || !user_text || user_text[0] == '\0') {
+    if (!session_id || session_id[0] == '\0' || !user_text || user_text[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -2392,39 +2339,30 @@ esp_err_t claw_core_submit_user_message_interrupt(uint32_t request_id, const cha
         free(owned_text);
         return ESP_ERR_TIMEOUT;
     }
-    if (s_core->inflight_request_id != request_id) {
+    if (s_core->inflight_request_id == 0 ||
+            s_core->inflight_session_id[0] == '\0' ||
+            strcmp(s_core->inflight_session_id, session_id) != 0) {
         xSemaphoreGive(s_core->inflight_lock);
         free(owned_text);
         return ESP_ERR_NOT_FOUND;
     }
-    if (s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_IDLE ||
-            s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_FINALIZING) {
-        xSemaphoreGive(s_core->inflight_lock);
-        free(owned_text);
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (s_core->control_queue_count >= CLAW_CORE_CONTROL_QUEUE_LEN) {
-        xSemaphoreGive(s_core->inflight_lock);
-        free(owned_text);
-        return ESP_ERR_NO_MEM;
-    }
 
-    tail = (s_core->control_queue_head + s_core->control_queue_count) % CLAW_CORE_CONTROL_QUEUE_LEN;
-    s_core->control_queue[tail].request_id = request_id;
-    s_core->control_queue[tail].user_text = owned_text;
-    s_core->control_queue_count++;
-    owned_text = NULL;
-
-    if (s_core->agent_loop_phase == CLAW_CORE_AGENT_LOOP_PHASE_IN_LLM_HTTP &&
-            s_core->inflight_abort_reason != CLAW_CORE_CONTROL_ABORT_REASON_CANCEL) {
-        s_core->inflight_abort = true;
-        s_core->inflight_abort_reason = CLAW_CORE_CONTROL_ABORT_REASON_USER_INTERRUPT;
+    request_id = s_core->inflight_request_id;
+    err = queue_user_interrupt_locked(request_id, owned_text);
+    if (err == ESP_OK) {
+        owned_text = NULL;
+        if (out_request_id) {
+            *out_request_id = request_id;
+        }
+        ESP_LOGI(TAG,
+                 "queued user interrupt request=%" PRIu32 " session=%s depth=%u",
+                 request_id,
+                 session_id,
+                 (unsigned)s_core->control_queue_count);
     }
-    ESP_LOGI(TAG, "queued user interrupt request=%" PRIu32 " depth=%u",
-             request_id,
-             (unsigned)s_core->control_queue_count);
     xSemaphoreGive(s_core->inflight_lock);
-    return ESP_OK;
+    free(owned_text);
+    return err;
 }
 
 claw_core_agent_loop_phase_t claw_core_get_agent_loop_phase(void)

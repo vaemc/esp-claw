@@ -27,7 +27,7 @@
 #endif
 #include "app_config.h"
 
-#define APP_ENABLE_MEM_LOG        (0)
+#define APP_ENABLE_MEM_LOG        (1)
 
 #define APP_FATFS_PARTITION_LABEL "storage"
 #define APP_RAMFS_BASE_PATH       "/ramfs"

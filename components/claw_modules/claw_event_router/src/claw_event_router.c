@@ -1534,6 +1534,7 @@ static esp_err_t claw_event_router_execute_agent_action(
     const char *target_channel = NULL;
     const char *target_chat_id = NULL;
     const char *session_policy = NULL;
+    uint32_t interrupted_request_id = 0;
     claw_event_t agent_event = {0};
     claw_core_request_t request = {0};
     char session_id[128] = {0};
@@ -1561,7 +1562,6 @@ static esp_err_t claw_event_router_execute_agent_action(
         claw_event_router_parse_session_policy(session_policy, &agent_event.session_policy);
     }
 
-    request.request_id = s_runtime->next_request_id++;
     if (claw_event_router_build_session_id_with_config(&agent_event, session_id, sizeof(session_id)) > 0) {
         request.session_id = session_id;
     }
@@ -1576,6 +1576,55 @@ static esp_err_t claw_event_router_execute_agent_action(
     request.target_channel = (target_channel && target_channel[0]) ? target_channel : event->source_channel;
     request.target_chat_id = (target_chat_id && target_chat_id[0]) ? target_chat_id : event->chat_id;
 
+    if (request.session_id && request.session_id[0] &&
+            request.user_text && request.user_text[0]) {
+        err = claw_core_submit_user_message_interrupt_for_session(request.session_id,
+                                                                  request.user_text,
+                                                                  &interrupted_request_id);
+        if (err == ESP_OK) {
+            snprintf(submit_output,
+                     sizeof(submit_output),
+                     "request_id=%" PRIu32,
+                     interrupted_request_id);
+            claw_event_router_update_last_output(ctx,
+                                                 "agent",
+                                                 request.target_channel,
+                                                 "interrupted",
+                                                 submit_output);
+            if (result) {
+                result->action_count++;
+            }
+            ESP_LOGI(TAG,
+                     "Rule %s interrupted active agent request=%" PRIu32 " session=%s",
+                     rule->id,
+                     interrupted_request_id,
+                     request.session_id);
+            cJSON_Delete(rendered_input);
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_INVALID_STATE) {
+            claw_event_router_update_last_output(ctx,
+                                                 "agent",
+                                                 request.target_channel,
+                                                 "error",
+                                                 esp_err_to_name(err));
+            if (result) {
+                result->action_count++;
+                result->failed_actions++;
+                result->last_error = err;
+            }
+            if (!action->fail_open) {
+                ESP_LOGW(TAG,
+                         "Rule %s agent interrupt failed: %s",
+                         rule->id,
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(rendered_input);
+            return err;
+        }
+    }
+
+    request.request_id = s_runtime->next_request_id++;
     err = claw_core_submit(&request, s_runtime->config.core_submit_timeout_ms);
 
     if (err == ESP_OK) {
